@@ -560,7 +560,7 @@ def get_text_embedding(prompt, tokenizer, text_encoder, accelerator):
     return text_encoder(input_ids)[0]
 
 
-def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prompts, num_inference_steps=10, guidance_scale=7.5, generator_seed=None, with_log_prob = False, grad = False, precomputed_text_embeddings=None, precomputed_uncond_embeddings=None):
+def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prompts, num_inference_steps=10, guidance_scale=7.5, generator_seed=None, with_KL = False, with_log_prob = False, grad = False, precomputed_text_embeddings=None, precomputed_uncond_embeddings=None):
 
     #example usage:
     # prompts = ["impressionist painting", "van gogh painting", "photo of a dog", "astronaut on moon"]
@@ -583,6 +583,10 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
     if with_log_prob == True:
         # Create log_probs tensor without moving to device immediately
         log_probs = torch.zeros(len(prompts), requires_grad = True)
+    if with_KL == True:
+        KL = torch.zeros(len(prompts), requires_grad = True)
+
+
 
     
     if not grad:
@@ -602,14 +606,14 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
         # Use pre-computed embeddings if provided, otherwise create dummy embeddings
         if precomputed_text_embeddings is not None:
             text_embeddings = precomputed_text_embeddings
-        else:
-            text_embeddings = torch.randn(batch_size, 77, embedding_dim, device=accelerator.device, dtype=torch.float16)
+        # else:
+        #     text_embeddings = torch.randn(batch_size, 77, embedding_dim, device=accelerator.device, dtype=torch.float16)
         
         # Use pre-computed unconditional embeddings if provided, otherwise create dummy embeddings
         if precomputed_uncond_embeddings is not None:
             uncond_embeddings = precomputed_uncond_embeddings
-        else:
-            uncond_embeddings = torch.randn(batch_size, 77, embedding_dim, device=accelerator.device, dtype=torch.float16)
+        # else:
+        #     uncond_embeddings = torch.randn(batch_size, 77, embedding_dim, device=accelerator.device, dtype=torch.float16)
         
         # Prepare scheduler
         scheduler.set_timesteps(num_inference_steps)
@@ -620,10 +624,13 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
             generator=generator
         ).to(accelerator.device)
         latents = latents * scheduler.init_noise_sigma
+        latents_pre = latents.clone()
         
         # Move log_probs to device now if needed
         if with_log_prob == True:
             log_probs = log_probs.to(accelerator.device)
+        if with_KL == True:
+            KL = KL.to(accelerator.device)
         
         # Sampling loop
         progress_bar = tqdm(total=len(scheduler.timesteps))
@@ -633,7 +640,8 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
 
             # Expand latents for classifier free guidance
             latent_model_input = torch.cat([latents] * 2)
-            
+
+    
             # Get model prediction - remove redundant .to(device) calls
             noise_pred = unet(
                 latent_model_input,
@@ -651,6 +659,43 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
             
             if with_log_prob == True:
                 log_probs_accumulator = log_probs_accumulator + log_prob
+
+            if with_KL == True:
+
+                # Access the underlying model through DDP wrapper
+                if hasattr(unet, 'module'):
+                    # Multi-GPU case: unet is wrapped in DDP
+                    unet.module.disable_adapters()
+                else:
+                    # Single GPU case: unet is the model directly
+                    unet.disable_adapters()
+
+                with torch.no_grad():
+
+                    noise_pred_pre = unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=torch.cat([uncond_embeddings, text_embeddings])
+                    ).sample
+
+                    # Perform guidance
+                    noise_pred_uncond, noise_pred_text = noise_pred_pre.chunk(2)
+
+                    noise_pred_pre = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    
+                    # Compute previous noisy sample
+                    # latents_pre,_,log_prob_pre = scheduler.step(noise_pred, t, latents, return_log_prob = True, return_dict = False, eta = 0.5, generator = generator)
+
+                KL = KL + torch.nn.functional.mse_loss(noise_pred_pre, noise_pred)
+                
+                # Re-enable adapters
+                if hasattr(unet, 'module'):
+                    # Multi-GPU case: unet is wrapped in DDP
+                    unet.module.enable_adapters()
+                else:
+                    # Single GPU case: unet is the model directly
+                    unet.enable_adapters()
+
             
             progress_bar.update(1)
         progress_bar.close()
@@ -658,12 +703,27 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
         # Decode latents to image
         # Decode latents to image using VAE
         if grad:
-            return log_probs_accumulator, latents
+            if with_log_prob == True and with_KL == True:
+                return log_probs_accumulator, KL, latents
+            if with_log_prob == True:
+                return log_probs_accumulator, latents
+            if with_KL == True:
+                return KL, latents
         
-        latents = latents / vae.config.scaling_factor
+        # Access the underlying VAE model through DDP wrapper
+        if hasattr(vae, 'module'):
+            # Multi-GPU case: vae is wrapped in DDP
+            scaling_factor = vae.module.config.scaling_factor
+            vae_model = vae.module
+        else:
+            # Single GPU case: vae is the model directly
+            scaling_factor = vae.config.scaling_factor
+            vae_model = vae
+            
+        latents = latents / scaling_factor
 
         # vae.to(accelerator.device)
-        image = vae.decode(latents.half(), return_dict=False)[0]
+        image = vae_model.decode(latents.half(), return_dict=False)[0]
         
         # Normalize image to [0,1] range
         image = (image / 2 + 0.5).clamp(0, 1)
@@ -679,9 +739,21 @@ def evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, e
     images_lora_enabled = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, [args.prompt_unlearn], with_log_prob = False, num_inference_steps = args.num_inference_steps, grad = False, precomputed_text_embeddings=text_embeddings, precomputed_uncond_embeddings=uncond_embeddings, generator_seed = seed)
     
     #with lora disabled
-    unet.disable_adapters()
+    if hasattr(unet, 'module'):
+        # Multi-GPU case: unet is wrapped in DDP
+        unet.module.disable_adapters()
+    else:
+        # Single GPU case: unet is the model directly
+        unet.disable_adapters()
+        
     images_lora_disabled = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, [args.prompt_unlearn], with_log_prob = False, num_inference_steps = args.num_inference_steps, grad = False, precomputed_text_embeddings=text_embeddings, precomputed_uncond_embeddings=uncond_embeddings, generator_seed = seed)
-    unet.enable_adapters()
+    
+    if hasattr(unet, 'module'):
+        # Multi-GPU case: unet is wrapped in DDP
+        unet.module.enable_adapters()
+    else:
+        # Single GPU case: unet is the model directly
+        unet.enable_adapters()
 
 
     
@@ -709,7 +781,7 @@ def evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, e
 
 
 
-def compute_KL(accelerator, scheduler, unet, vae, tokenizer, text_encoder, init_latents, prompts, num_inference_steps=10, n_noise_samples = 1):
+def compute_likelihood(accelerator, scheduler, unet, vae, tokenizer, text_encoder, init_latents, prompts, num_inference_steps=10, n_noise_samples = 1):
     
     with torch.no_grad():
         # Get text embeddings

@@ -1,4 +1,4 @@
-from my_utils import sample_loop, compute_KL, my_DDIMScheduler, evaluate
+from my_utils import sample_loop, compute_likelihood, my_DDIMScheduler, evaluate
 from diffusers import StableDiffusionPipeline
 import torch
 import argparse
@@ -11,7 +11,7 @@ from diffusers import AutoencoderKL
 from transformers import CLIPTextModel, CLIPTokenizer
 from PIL import Image
 from transformers import get_cosine_schedule_with_warmup
-
+import os
 
 
 
@@ -24,9 +24,9 @@ def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description='Training configuration for diffusion model')
     
     # General training parameters
-    parser.add_argument('--num_epochs', type=int, default=100,
+    parser.add_argument('--num_epochs', type=int, default=400,
                        help='Number of epochs')
-    parser.add_argument('--use_wandb', type=int, default=0,
+    parser.add_argument('--use_wandb', type=int, default=1,
                        help='Use wandb')
     parser.add_argument('--num_inference_steps', type=int, default=10,
                        help='Number of inference steps')
@@ -34,6 +34,8 @@ def parse_args(input_args=None):
                        help='Number of noise samples for KL computation')
     parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate')
+    parser.add_argument('--lr_dual', type=float, default=0.1,
+                       help='Learning rate for dual')
     parser.add_argument('--batch_size', type=int, default=1,
                        help='Batch size')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
@@ -46,14 +48,20 @@ def parse_args(input_args=None):
                        help='LoRA alpha')
     parser.add_argument('--eval_every', type=int, default=10,
                        help='Evaluate every n epochs')
-    parser.add_argument('--reward_type', type=str, default='log_likelihood',
+    parser.add_argument('--reward_type', type=str, default='likelihood',
                        help='Reward type')
-    parser.add_argument('--prompt_unlearn', type=str, default='impressionist painting',
+    parser.add_argument('--prompt_unlearn', type=str, default='photo of a cat',
                        help='Unlearn prompt')
-    parser.add_argument('--prompt_close', type=str, default='painting',
+    parser.add_argument('--prompt_close', type=str, default='photo of a dog',
                        help='Close prompt')
-    parser.add_argument('--prompt_far', type=str, default='a photo of a car',
+    parser.add_argument('--prompt_far', type=str, default='impressionist painting',
                        help='Far prompt')
+    parser.add_argument('--prompt_context', type=str, default='photo of a cat in a grass field',
+                       help='Context prompt')
+    parser.add_argument('--lamb_init', type=float, default=0.0,
+                       help='Initial lambda')
+    parser.add_argument('--b', type=float, default=0.0,
+                       help='b')
 
 
 
@@ -81,6 +89,9 @@ def parse_args(input_args=None):
 
 def main(args):
 
+    # Set CUDA_VISIBLE_DEVICES to GPU 1
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
     # Create and setup UNet
     pipe = StableDiffusionPipeline.from_pretrained("nota-ai/bk-sdm-tiny")
     vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", use_safetensors=True, torch_dtype=torch.float16)
@@ -92,7 +103,7 @@ def main(args):
     unet = pipe.unet
 
     # Basic fine-tuning training loop
-    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator = Accelerator(mixed_precision="fp16", gradient_accumulation_steps=args.gradient_accumulation_steps)
 
     # Move text_encoder to device once during initialization
     text_encoder = text_encoder.to(accelerator.device)
@@ -101,7 +112,7 @@ def main(args):
     print("Pre-computing text embeddings...")
     with torch.no_grad():
         text_embeddings_list = []
-        for prompt in [args.prompt_unlearn, args.prompt_close, args.prompt_far]:
+        for prompt in [args.prompt_unlearn, args.prompt_close, args.prompt_far, args.prompt_context]:
             # Tokenize the prompt
             text_input = tokenizer(
                 [prompt], 
@@ -129,14 +140,14 @@ def main(args):
 
     # Initialize wandb (optional)
     if args.use_wandb:
-        wandb.init(project="reverse_kl_unlearning_stablediff", name="fine_tuning_experiment")
+        wandb.init(project="reverse_kl_unlearning_stablediff")
         wandb.config.update(vars(args))
 
 
  
 
-    lamb = torch.tensor(0.0, requires_grad = False)
-    b = torch.tensor(0.1, requires_grad = False)
+    lamb = torch.tensor(args.lamb_init, requires_grad = False)
+    b = torch.tensor(args.b, requires_grad = False)
 
     unet.train()
 
@@ -144,7 +155,7 @@ def main(args):
 
     unet_lora_config = LoraConfig(
         r=args.lora_r,
-        lora_alpha=args.lora_alpha,
+        lora_alpha=args.lora_r,
         init_lora_weights="gaussian",
         target_modules=["to_q", "to_k", "to_v", "to_out.0"],
     )
@@ -180,9 +191,12 @@ def main(args):
         #     assert False
         epoch_loss = 0.0
         num_batches = 0
+        epoch_KL = 0.0
+        epoch_rewards = 0.0
+
         
-        # Generate training data batches
-        for batch_idx in range(1):  # Adjust number of batches as needed
+        # Generate training data batches with gradient accumulation
+        for batch_idx in range(args.gradient_accumulation_steps):
             
             with accelerator.accumulate(unet):
 
@@ -191,9 +205,8 @@ def main(args):
                 # Pass pre-computed embeddings instead of computing them in sample_loop
                 # random_int = torch.randint(0, 100000, (1,)).item()
                 
-                log_probs, latents = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, [args.prompt_unlearn], with_log_prob = True, num_inference_steps = args.num_inference_steps, grad = True, precomputed_text_embeddings=text_embeddings_list[0], precomputed_uncond_embeddings=uncond_embeddings)
-                print(log_probs)
-
+                log_probs, KL, latents = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, [args.prompt_unlearn], with_log_prob = True, with_KL = True, num_inference_steps = args.num_inference_steps, grad = True, precomputed_text_embeddings=text_embeddings_list[0], precomputed_uncond_embeddings=uncond_embeddings)
+       
                 # latents = latents.detach()
 
                 with torch.no_grad():
@@ -201,11 +214,12 @@ def main(args):
                     unet.eval()
 
 
-                    if epoch%args.eval_every == 0:
+                    if epoch%args.eval_every == 0 and batch_idx == 0:  # Only evaluate once per epoch
                         evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, epoch, text_embeddings_list[0], uncond_embeddings, caption = "unlearn concept", seed = 42)
                         evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, epoch, text_embeddings_list[1], uncond_embeddings, caption = "close concept", seed = 42)
                         evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, epoch, text_embeddings_list[2], uncond_embeddings, caption = "far concept", seed = 42)
-
+                        evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, epoch, text_embeddings_list[3], uncond_embeddings, caption = "unlearn concept in context", seed = 42)
+        
                         
                     
                     
@@ -217,8 +231,8 @@ def main(args):
 
                     
                     # Compute rewards without LoRA modifications
-                    rewards = (compute_KL(accelerator, scheduler, unet, vae, tokenizer, text_encoder, latents[0], [args.prompt_unlearn], num_inference_steps=args.num_inference_steps, n_noise_samples = args.n_noise_samples))
-                    print(rewards)
+                    rewards = (compute_likelihood(accelerator, scheduler, unet, vae, tokenizer, text_encoder, latents[0], [args.prompt_unlearn], num_inference_steps=args.num_inference_steps, n_noise_samples = args.n_noise_samples))
+                    # print(rewards)
                     if args.reward_type == "log_likelihood":
                         pass
                     elif args.reward_type == "likelihood":
@@ -239,29 +253,36 @@ def main(args):
 
                 # FIXED: Check for NaN in loss
                 if torch.isnan(r):
-                    print(f"NaN loss detected in epoch {epoch+1}")
+                    print(f"NaN loss detected in epoch {epoch+1}, batch {batch_idx+1}")
                     
                 # Compute loss (MSE between predicted and actual noise)
-                loss = r
+                # Scale loss by gradient accumulation steps for proper averaging
+                loss = (lamb*r + KL) / args.gradient_accumulation_steps
 
                 # Backward pass
                 accelerator.backward(loss)
 
-                # Check for inf/nan gradients and handle them
-                # for param in lora_layers:
-                #     if param.grad is not None:
-                #         if torch.isinf(param.grad).any() or torch.isnan(param.grad).any():
-                #             print(f"WARNING: Parameter has inf/nan gradients, setting to zero")
-                #             param.grad.zero_()
+                # Only update optimizer and lr_scheduler after accumulating all gradients
+                if accelerator.sync_gradients:
+                    # Check for inf/nan gradients and handle them
+                    # for param in lora_layers:
+                    #     if param.grad is not None:
+                    #         if torch.isinf(param.grad).any() or torch.isnan(param.grad).any():
+                    #             print(f"WARNING: Parameter has inf/nan gradients, setting to zero")
+                    #             param.grad.zero_()
 
-                # Skip gradient clipping for now to avoid FP16 unscale issues
-                # We'll handle gradient issues by checking for inf/nan above
-                accelerator.clip_grad_norm_(lora_layers, max_norm=1.0)
+                    # Skip gradient clipping for now to avoid FP16 unscale issues
+                    # We'll handle gradient issues by checking for inf/nan above
+                    accelerator.clip_grad_norm_(lora_layers, max_norm=1.0)
 
-                # Use accelerator's step method which handles mixed precision scaling
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()   
+                    # Use accelerator's step method which handles mixed precision scaling
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
+                    
+
+
 
                 # Print gradients of trainable parameters
                 # print(f"Batch {batch_idx+1}, Epoch {epoch+1} - Gradients:")
@@ -276,25 +297,32 @@ def main(args):
                 #         grad_norm = param.data.norm().item()
                 #         print(f"  {name}: param_norm={grad_norm:.6f}")
 
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * args.gradient_accumulation_steps  # Undo scaling for logging
                 num_batches += 1
+                epoch_KL += KL.item()
+                epoch_rewards += rewards.mean().item()
                 # del loss
         
         avg_loss = epoch_loss / num_batches
-        print(f"Epoch {epoch+1}/{args.num_epochs}, Average Loss: {avg_loss:.6f}")
+        avg_KL = epoch_KL / num_batches
+        avg_rewards = epoch_rewards / num_batches
+        print(f"Epoch {epoch+1}/{args.num_epochs}, Average Loss: {avg_loss:.6f}, Average KL: {avg_KL:.6f}, Average Rewards: {avg_rewards:.6f}")
 
-        
+        lamb = lamb + args.lr_dual*(avg_rewards - b)
+        if lamb < 0.0:
+            lamb = 0.0*lamb
+
 
 
         
         # Log to wandb (optional)
         if args.use_wandb:
             wandb.log({
-                "reward (" + args.reward_type + ")": rewards.mean(),
-                "loss": loss.item(),
+                "reward (" + args.reward_type + ")": avg_rewards,
+                "loss": avg_loss,
                 "lr": lr_scheduler.get_last_lr()[0],
-                # "lamb": lamb
-                
+                "KL": avg_KL,
+                "lamb": lamb.item(),
             }, step=epoch)
 
         
