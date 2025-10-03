@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import os
 import torch
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -36,6 +37,10 @@ from diffusers import DDIMScheduler
 from diffusers import StableDiffusionPipeline
 import wandb
 from tqdm.auto import tqdm
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from cleanfid import fid
+
 
 @dataclass
 # Copied from diffusers.schedulers.scheduling_ddpm.DDPMSchedulerOutput with DDPM->DDIM
@@ -560,19 +565,11 @@ def get_text_embedding(prompt, tokenizer, text_encoder, accelerator):
     return text_encoder(input_ids)[0]
 
 
-def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prompts, num_inference_steps=10, guidance_scale=7.5, generator_seed=None, with_KL = False, with_log_prob = False, grad = False, precomputed_text_embeddings=None, precomputed_uncond_embeddings=None):
-
-    #example usage:
-    # prompts = ["impressionist painting", "van gogh painting", "photo of a dog", "astronaut on moon"]
-
-    # image, log_probs, latents = sample_loop(unet, prompts, with_log_prob = True, num_inference_steps = 10)
-
-    # for i in range(len(image)):
-    #     plt.imshow(image[i].cpu().numpy())
-    #     plt.show()
-
-    # print(log_probs)
-
+def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, batch_size, num_inference_steps=10, guidance_scale=7.5, generator_seed=None, with_KL = False, with_log_prob = False, grad = False, precomputed_text_embeddings=None, precomputed_uncond_embeddings=None):
+    
+    if len(precomputed_text_embeddings) > 1:
+        batch_size = len(precomputed_text_embeddings)
+    
     # Set generator seed if provided - use CPU generator to avoid multi-GPU issues
     generator = None
     if generator_seed is not None:
@@ -582,9 +579,9 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
     
     if with_log_prob == True:
         # Create log_probs tensor without moving to device immediately
-        log_probs = torch.zeros(len(prompts), requires_grad = True)
+        log_probs = torch.zeros(batch_size, requires_grad = True)
     if with_KL == True:
-        KL = torch.zeros(len(prompts), requires_grad = True)
+        KL = torch.zeros(batch_size, requires_grad = True)
 
 
 
@@ -598,33 +595,26 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
         
         # Pre-compute text embeddings outside the function to avoid multi-GPU issues
         
-        # For now, let's use a simple approach - create dummy embeddings
-        # This is a temporary fix to get past the tokenizer issue
-        batch_size = len(prompts)
-        embedding_dim = 768  # CLIP text encoder output dimension
+      
         
-        # Use pre-computed embeddings if provided, otherwise create dummy embeddings
+        # Use pre-computed embeddings if provided
         if precomputed_text_embeddings is not None:
             text_embeddings = precomputed_text_embeddings
-        # else:
-        #     text_embeddings = torch.randn(batch_size, 77, embedding_dim, device=accelerator.device, dtype=torch.float16)
-        
-        # Use pre-computed unconditional embeddings if provided, otherwise create dummy embeddings
+       
+        # Use pre-computed unconditional embeddings if provided
         if precomputed_uncond_embeddings is not None:
             uncond_embeddings = precomputed_uncond_embeddings
-        # else:
-        #     uncond_embeddings = torch.randn(batch_size, 77, embedding_dim, device=accelerator.device, dtype=torch.float16)
-        
-        # Prepare scheduler
+    
         scheduler.set_timesteps(num_inference_steps)
         
         # Prepare latents - create on CPU first, then move to device
         latents = torch.randn(
-            (len(prompts), 4, 64, 64),
+            (batch_size, 4, 64, 64),
             generator=generator
         ).to(accelerator.device)
+
         latents = latents * scheduler.init_noise_sigma
-        latents_pre = latents.clone()
+ 
         
         # Move log_probs to device now if needed
         if with_log_prob == True:
@@ -639,23 +629,51 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
         for i,t in enumerate(scheduler.timesteps):
 
             # Expand latents for classifier free guidance
-            latent_model_input = torch.cat([latents] * 2)
+            # latent_model_input = torch.cat([latents] * 2)
+            latent_model_input = latents
+
 
     
             # Get model prediction - remove redundant .to(device) calls
-            noise_pred = unet(
+            # noise_pred = unet(
+            #     latent_model_input,
+            #     t,
+            #     encoder_hidden_states=torch.cat([uncond_embeddings, text_embeddings])
+            # ).sample
+            noise_pred_uncond = unet(
                 latent_model_input,
                 t,
-                encoder_hidden_states=torch.cat([uncond_embeddings, text_embeddings])
+                encoder_hidden_states=torch.cat([uncond_embeddings]*batch_size)
             ).sample
 
+            if len(text_embeddings) == 1:
+                noise_pred_text = unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=torch.cat([text_embeddings]*batch_size)
+                ).sample
+            else:
+                noise_pred_text = unet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings
+                ).sample
+
+
+            
+
+            
+
             # Perform guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
 
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
             
             # Compute previous noisy sample
             latents,_,log_prob = scheduler.step(noise_pred, t, latents, return_log_prob = True, return_dict = False, eta = 0.5, generator = generator)
+
+
             
             if with_log_prob == True:
                 log_probs_accumulator = log_probs_accumulator + log_prob
@@ -672,21 +690,33 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
 
                 with torch.no_grad():
 
-                    noise_pred_pre = unet(
+                    noise_pred_pre_uncond = unet(
                         latent_model_input,
                         t,
-                        encoder_hidden_states=torch.cat([uncond_embeddings, text_embeddings])
+                        encoder_hidden_states=torch.cat([uncond_embeddings]*batch_size)
                     ).sample
 
-                    # Perform guidance
-                    noise_pred_uncond, noise_pred_text = noise_pred_pre.chunk(2)
+                    noise_pred_pre_text = unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=torch.cat([text_embeddings]*batch_size)
+                    ).sample
+                    
 
-                    noise_pred_pre = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    # Perform guidance
+                    # noise_pred_uncond, noise_pred_text = noise_pred_pre.chunk(2)
+
+                    noise_pred_pre = noise_pred_pre_uncond + guidance_scale * (noise_pred_pre_text - noise_pred_pre_uncond)
                     
                     # Compute previous noisy sample
                     # latents_pre,_,log_prob_pre = scheduler.step(noise_pred, t, latents, return_log_prob = True, return_dict = False, eta = 0.5, generator = generator)
 
-                KL = KL + torch.nn.functional.mse_loss(noise_pred_pre, noise_pred)
+                    KL_change = torch.mean((noise_pred_pre - noise_pred)**2, dim = [1,2,3])
+                    
+
+                KL = KL + KL_change
+
+
                 
                 # Re-enable adapters
                 if hasattr(unet, 'module'):
@@ -734,10 +764,21 @@ def sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, prom
 
     return image
 
-def evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, epoch, text_embeddings, uncond_embeddings, seed = None, caption = None):
+def evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, epoch, text_embeddings, uncond_embeddings, seed = None, caption_list = None, log_images = False):
     #with lora enabled
-    images_lora_enabled = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, [args.prompt_unlearn], with_log_prob = False, num_inference_steps = args.num_inference_steps, grad = False, precomputed_text_embeddings=text_embeddings, precomputed_uncond_embeddings=uncond_embeddings, generator_seed = seed)
-    
+    images_lora_enabled = sample_loop(
+        accelerator,
+        scheduler,
+        unet,
+        vae,
+        tokenizer,
+        text_encoder,
+        batch_size=1,
+        num_inference_steps=args.num_inference_steps,
+        precomputed_text_embeddings=text_embeddings,
+        precomputed_uncond_embeddings=uncond_embeddings,
+        generator_seed=seed
+    )
     #with lora disabled
     if hasattr(unet, 'module'):
         # Multi-GPU case: unet is wrapped in DDP
@@ -746,8 +787,19 @@ def evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, e
         # Single GPU case: unet is the model directly
         unet.disable_adapters()
         
-    images_lora_disabled = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, [args.prompt_unlearn], with_log_prob = False, num_inference_steps = args.num_inference_steps, grad = False, precomputed_text_embeddings=text_embeddings, precomputed_uncond_embeddings=uncond_embeddings, generator_seed = seed)
-    
+    images_lora_disabled = sample_loop(
+        accelerator,
+        scheduler,
+        unet,
+        vae,
+        tokenizer,
+        text_encoder,
+        batch_size=1,
+        num_inference_steps=args.num_inference_steps,
+        precomputed_text_embeddings=text_embeddings,
+        precomputed_uncond_embeddings=uncond_embeddings,
+        generator_seed=seed
+    )
     if hasattr(unet, 'module'):
         # Multi-GPU case: unet is wrapped in DDP
         unet.module.enable_adapters()
@@ -756,42 +808,114 @@ def evaluate(accelerator, scheduler, unet, vae, tokenizer, text_encoder, args, e
         unet.enable_adapters()
 
 
-    
-    # Save images
-    # for i, img in enumerate(images_lora_enabled):
-    #     img_pil = Image.fromarray(img.cpu().numpy())
-    #     img_pil.save(f"epoch_{epoch+1}_sample_{i}_lora_enabled.png")
-        
-    # for i, img in enumerate(images_lora_disabled):
-    #     img_pil = Image.fromarray(img.cpu().numpy())
-    #     img_pil.save(f"epoch_{epoch+1}_sample_{i}_lora_disabled.png")
 
-    if args.use_wandb:
+    if log_images and len(text_embeddings) > 1 and args.use_wandb and accelerator.is_main_process:
+        img_lora_enabled = images_lora_enabled.cpu().numpy()
+        img_lora_disabled = images_lora_disabled.cpu().numpy()
+
+        
+
+        for i in range(len(caption_list)):
+            grid_img = np.concatenate([img_lora_disabled[i], img_lora_enabled[i]], axis=1)
+            accelerator.log({
+                caption_list[i]: wandb.Image(grid_img, caption=f"Left: LoRA disabled, Right: LoRA enabled - Epoch {epoch+1}")
+            }, step=epoch)
+        
+
+
+        
+
+
+    if args.use_wandb and len(text_embeddings) == 1 and accelerator.is_main_process:
         # Convert images to numpy arrays
-        img_lora_enabled = images_lora_enabled[0].cpu().numpy()
-        img_lora_disabled = images_lora_disabled[0].cpu().numpy()
+        img_lora_enabled = images_lora_enabled.cpu().numpy()
+        img_lora_disabled = images_lora_disabled.cpu().numpy()
         
         # Create side-by-side grid
         grid_img = np.concatenate([img_lora_enabled, img_lora_disabled], axis=1)
         
         # Log to wandb
-        wandb.log({
-            caption: wandb.Image(grid_img, caption=f"Left: LoRA enabled, Right: LoRA disabled - Epoch {epoch+1}")
+        accelerator.log({
+            caption_list[0]: wandb.Image(grid_img, caption=f"Left: LoRA enabled, Right: LoRA disabled - Epoch {epoch+1}")
         }, step=epoch)
 
 
+def evaluate_clip_FID(accelerator, scheduler, unet, vae, tokenizer, text_encoder, clip_processor, clip_model, batch_size, num_batches, args, epoch, prompts, text_embeddings, uncond_embeddings, seed = None, caption_list = None, log_images = False, compute_FID = False, save_dir = None):
 
-def compute_likelihood(accelerator, scheduler, unet, vae, tokenizer, text_encoder, init_latents, prompts, num_inference_steps=10, n_noise_samples = 1):
-    
-    with torch.no_grad():
-        # Get text embeddings
-        text_embeddings = []
-        for prompt in prompts:
-            text_embeddings.append(get_text_embedding(prompt, tokenizer, text_encoder, accelerator))
-        text_embeddings = torch.cat(text_embeddings)
+    if compute_FID and accelerator.is_main_process:
+        # Save generated images to a folder
+        if save_dir is None:
+            save_dir = f"generated_images"
+        if os.path.exists(save_dir):
+            import shutil
+            shutil.rmtree(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
+
+    accelerator.wait_for_everyone()
+
+    clip_score = torch.zeros(len(prompts), device=accelerator.device)
+
+    for i in range(num_batches):
+        print('sample_loop on device:', accelerator.device)
+        images = sample_loop(accelerator, scheduler, unet, vae, tokenizer, text_encoder, batch_size=batch_size, num_inference_steps=args.num_inference_steps, precomputed_text_embeddings=text_embeddings, precomputed_uncond_embeddings=uncond_embeddings)
+
+        images_np = images.cpu().numpy()
+
+        # Convert to PIL for CLIP
+        pil_images = [Image.fromarray((img).astype(np.uint8)) for img in images_np]
+
+        inputs = clip_processor(text=prompts, images=pil_images, return_tensors="pt", padding=True).to(accelerator.device)
+        outputs = clip_model(**inputs)
+        clip_scores = outputs.logits_per_image.detach()
+
+        clip_score += clip_scores.mean(axis = 0)
         
-        # Get unconditional embeddings for classifier free guidance
-        uncond_embeddings = get_text_embedding([""], tokenizer, text_encoder, accelerator)
+
+        if compute_FID:
+            for idx, img in enumerate(pil_images):
+                img_save_path = os.path.join(save_dir, f"prompt_{idx}_batch_{i}_device_{accelerator.device}.png")
+                img.save(img_save_path)
+
+    # Wait for all processes to complete before computing FID
+    accelerator.wait_for_everyone()
+    if compute_FID and accelerator.is_main_process:
+        dataset_name = prompts[0].replace(" ", "_") + '_stats'
+        if not fid.test_stats_exists(dataset_name, mode = 'clean'):
+            assert False
+        print(f"Computing FID between {dataset_name} and {save_dir}")
+        fid_score = fid.compute_fid(save_dir, dataset_name = dataset_name, mode = 'clean', dataset_split = 'custom')
+        print(f"FID score: {fid_score}")
+    else:
+        fid_score = None
+
+
+
+
+    
+
+
+    clip_score /= (num_batches)
+    return torch.tensor(clip_score), fid_score
+
+
+
+def compute_likelihood(accelerator, scheduler, unet, vae, tokenizer, text_encoder, init_latents, batch_size, num_inference_steps=10, n_noise_samples = 1, precomputed_text_embeddings=None, precomputed_uncond_embeddings=None):
+    
+
+    batch_size = init_latents.shape[0]
+
+    with torch.no_grad():
+        # Use pre-computed embeddings if provided, otherwise throw error
+        if precomputed_text_embeddings is not None:
+            text_embeddings = precomputed_text_embeddings
+        else:
+            raise ValueError("Pre-computed text embeddings are required for computing likelihood")
+
+        # Use pre-computed unconditional embeddings if provided, otherwise throw error
+        if precomputed_uncond_embeddings is not None:
+            uncond_embeddings = precomputed_uncond_embeddings
+        else:
+            raise ValueError("Pre-computed unconditional embeddings are required for computing likelihood")
 
         uncond_embeddings = uncond_embeddings.repeat(n_noise_samples, 1, 1)
         text_embeddings = text_embeddings.repeat(n_noise_samples, 1, 1)
@@ -799,9 +923,7 @@ def compute_likelihood(accelerator, scheduler, unet, vae, tokenizer, text_encode
         # Prepare scheduler
         scheduler.set_timesteps(num_inference_steps)
         
-
-
-        I = torch.zeros(len(prompts), device=accelerator.device)
+        I = torch.zeros(batch_size, device=accelerator.device)
 
 
         
@@ -809,39 +931,61 @@ def compute_likelihood(accelerator, scheduler, unet, vae, tokenizer, text_encode
         # Sampling loop
         progress_bar = tqdm(total=len(scheduler.timesteps))
         for t in scheduler.timesteps:
-            noise = torch.randn(n_noise_samples, *init_latents.shape, device=accelerator.device)
-            # print(t)
-            # Expand latents for classifier free guidance
-            # Compute previous noisy sample
-            noisy_latents = scheduler.add_noise(init_latents, noise, t)
 
-            latent_model_input = torch.cat([noisy_latents, noisy_latents])
+            # print("init_latents shape:", init_latents.shape)
+
+            lats_repeated = init_latents.repeat(n_noise_samples, 1, 1, 1)
+
+            # print("lats_repeated shape:", lats_repeated.shape)
+
+            
+
+            noise = torch.randn(*lats_repeated.shape, device=accelerator.device)
+
+            # print("noise shape:", noise.shape)
+
+            noisy_latents = scheduler.add_noise(lats_repeated, noise, t)
+
+            # print("noisy_latents shape:", noisy_latents.shape)
+
+            
+
+            latent_model_input = noisy_latents
 
 
 
+            noise_pred_uncond = unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=torch.cat([uncond_embeddings]*batch_size)
+            ).sample
 
-            for i,prompt in enumerate(prompts):
+            noise_pred_text = unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=torch.cat([text_embeddings]*batch_size)
+            ).sample
 
-               
+            # print("noise_pred_uncond shape:", noise_pred_uncond.shape)
+            # print("noise_pred_text shape:", noise_pred_text.shape)
+            # print("noise shape:", noise.shape)
 
-                noise_pred_cond = unet(
-                    latent_model_input.to(accelerator.device),
-                    t,
-                    encoder_hidden_states=torch.cat([uncond_embeddings, text_embeddings]).to(accelerator.device)
-                ).sample
 
-                
-   
-                noise_preds_text = noise_pred_cond.chunk(2)[1]
-                noise_preds_uncond = noise_pred_cond.chunk(2)[0]
 
-                
+            I_uncond = torch.mean((noise_pred_uncond - noise)**2, dim = [1,2,3])
 
-                
+            I_text = torch.mean((noise_pred_text - noise)**2, dim = [1,2,3])
 
-                
-                # I[i] += 1000*torch.nn.functional.mse_loss(noise_preds_text, noise_preds_uncond).float()
-                I[i] += (torch.nn.functional.mse_loss(noise, noise_preds_uncond) - torch.nn.functional.mse_loss(noise, noise_preds_text))
+            I_uncond = I_uncond.reshape(batch_size, -1)
+            I_text = I_text.reshape(batch_size, -1)
+
+            # print("I_uncond shape:", I_uncond.shape) 
+            # print("I_text shape:", I_text.shape)
+
+            I += torch.mean(I_uncond, dim = 1) + torch.mean(I_text, dim = 1)
+
+
+            I += (torch.nn.functional.mse_loss(noise, noise_pred_uncond) - torch.nn.functional.mse_loss(noise, noise_pred_text))
 
 
             
